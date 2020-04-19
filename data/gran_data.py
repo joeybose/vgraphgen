@@ -24,6 +24,9 @@ class GRANData(object):
 
     self.graphs = graphs
     self.num_graphs = len(graphs)
+    self.num_nodes_pmf = np.bincount([len(gg.nodes) for gg in
+                                            self.graphs])
+    self.num_nodes_pmf_train = self.num_nodes_pmf / self.num_nodes_pmf.sum()
     self.npr = np.random.RandomState(config.seed)
     self.node_order = config.dataset.node_order
     self.num_canonical_order = config.model.num_canonical_order

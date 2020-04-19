@@ -21,7 +21,7 @@ dataset:
   is_sample_subgraph: true # set to true if you want to sample subgraphs
   is_overwrite_precompute: false
   use_gran_data: true
-  sample_every: 100
+  sample_every: 1
 model:
   name: GRANMixtureBernoulli
   num_mix_component: 20
@@ -55,7 +55,7 @@ train:
   is_resume: false
   resume_epoch: 5000
   resume_dir: # exp/GRAN/your_exp_folder
-  resume_model: model_snapshot_0005000.pth
+  resume_model: model_snapshot_000700.pth
   temperature: 1.0
   r: 2.
 test:
@@ -68,7 +68,7 @@ test:
   num_vis: 20
   vis_num_row: 5 # visualize `num_vis` samples in `vis_num_row` rows
   better_vis: true
-  test_model_dir: ./exp/GRAN/GRANMixtureBernoulli_grid_2020-Apr-15-14-24-42_20793
+  test_model_dir: ./exp/GRAN/GRANMixtureBernoulli_grid_2020-Apr-18-15-35-54_9936
   test_model_name: model_snapshot_0000700.pth
 kl:
   free_bits: 0.

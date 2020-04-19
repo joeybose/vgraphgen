@@ -35,6 +35,7 @@ model:
   dimension_reduce: true
   has_attention: true
   edge_weight: 1.0e+0
+  conv_type: GCN
 train:
   optimizer: Adam
   lr_decay: 0.3
@@ -53,6 +54,8 @@ train:
   resume_epoch: 5000
   resume_dir: # exp/GRAN/your_exp_folder
   resume_model: model_snapshot_0005000.pth
+  temperature: 1.0
+  r: 2.
 test:
   batch_size: 20
   num_workers: 0
@@ -65,3 +68,14 @@ test:
   better_vis: false
   test_model_dir: snapshot_model
   test_model_name: gran_lobster.pth
+kl:
+  free_bits: 0.
+  num_graphs: 100
+  warmup: 10
+  sub_iter: 100
+  sub_iter_limit: 5
+  patience: 10.
+  kl_start: 1.
+  aggressive: false
+  kl_anneal: 0
+  beta: 1.0

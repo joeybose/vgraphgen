@@ -5,7 +5,10 @@ import os.path as osp
 import argparse
 import ipdb
 from collections import OrderedDict
+from utils.arg_helper import edict2dict
+import yaml
 import torch
+from easydict import EasyDict as edict
 import math
 from statistics import median, mean
 import random
@@ -68,41 +71,26 @@ class GRANMultiInputSequential(nn.Sequential):
                 input = [module(*input)]
         return input[0]
 
-def extract_batch(args, data_batch):
+def extract_batch(use_gran_data, dev, data_batch):
     batch_fwd = []
     data = {}
-    if args.use_gran_data and not args.is_ar:
+    if use_gran_data:
         data_batch = data_batch[0]
-        data['adj'] = data_batch['adj'].pin_memory().to(args.dev, non_blocking=True)
-        data['edges'] = data_batch['edges'].pin_memory().to(args.dev, non_blocking=True)
-        data['node_idx_gnn'] = data_batch['node_idx_gnn'].pin_memory().to(args.dev, non_blocking=True)
-        data['node_idx_feat'] = data_batch['node_idx_feat'].pin_memory().to(args.dev, non_blocking=True)
-        data['label'] = data_batch['label'].pin_memory().to(args.dev, non_blocking=True)
-        data['att_idx'] = data_batch['att_idx'].pin_memory().to(args.dev, non_blocking=True)
-        data['subgraph_idx'] = data_batch['subgraph_idx'].pin_memory().to(args.dev, non_blocking=True)
-        data['encoder_edges'] = data_batch['encoder_edges'].pin_memory().to(args.dev, non_blocking=True)
-        data['adj_pad_idx'] = data_batch['adj_pad_idx'].pin_memory().to(args.dev, non_blocking=True)
+        data['adj'] = data_batch['adj'].pin_memory().to(dev, non_blocking=True)
+        data['edges'] = data_batch['edges'].pin_memory().to(dev, non_blocking=True)
+        data['node_idx_gnn'] = data_batch['node_idx_gnn'].pin_memory().to(dev, non_blocking=True)
+        data['node_idx_feat'] = data_batch['node_idx_feat'].pin_memory().to(dev, non_blocking=True)
+        data['label'] = data_batch['label'].pin_memory().to(dev, non_blocking=True)
+        data['att_idx'] = data_batch['att_idx'].pin_memory().to(dev, non_blocking=True)
+        data['subgraph_idx'] = data_batch['subgraph_idx'].pin_memory().to(dev, non_blocking=True)
+        # data['encoder_edges'] = data_batch['encoder_edges'].pin_memory().to(dev, non_blocking=True)
+        # data['adj_pad_idx'] = data_batch['adj_pad_idx'].pin_memory().to(dev, non_blocking=True)
         data['num_nodes_gt'] = data_batch['num_nodes_gt']
-        batch_fwd.append(data)
-        return batch_fwd
-    elif args.use_gran_data and args.is_ar:
-        data_batch = data_batch[0]
-        data['adj'] = data_batch['adj'].pin_memory().to(args.dev, non_blocking=True)
-        data['node_idx_feat'] = data_batch['node_idx_feat'].pin_memory().to(args.dev, non_blocking=True)
-        data['subgraph_idx'] = data_batch['subgraph_idx'].pin_memory().to(args.dev, non_blocking=True)
-        data['encoder_edges'] = data_batch['encoder_edges'].pin_memory().to(args.dev, non_blocking=True)
-        data['num_nodes_gt'] = data_batch['num_nodes_gt']
-        data['idx_base'] = data_batch['idx_base']
-        # AR
-        data['edges_ar'] = data_batch['edges_ar']
-        data['node_idx_gnn_ar'] = data_batch['node_idx_gnn_ar']
-        data['att_idx_ar'] = data_batch['att_idx_ar']
-        data['label_ar'] = data_batch['label_ar']
         batch_fwd.append(data)
         return batch_fwd
     else:
-        data['adj'] = data_batch.x.pin_memory().to(args.dev, non_blocking=True)
-        data['edges'] = data_batch.edge_index.pin_memory().to(args.dev, non_blocking=True)
+        data['adj'] = data_batch.x.pin_memory().to(dev, non_blocking=True)
+        data['edges'] = data_batch.edge_index.pin_memory().to(dev, non_blocking=True)
         batch_fwd.append(data)
         return batch_fwd
 
@@ -476,3 +464,42 @@ def aggressive_burnin(args, epoch, kl_weight, anneal_rate, aggressive_flag,
         sub_iter += 1
 
     return sub_iter
+
+def snapshot(model, optimizer, config, step, gpus=[0], tag=None, scheduler=None):
+
+    if scheduler is not None:
+        model_snapshot = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "step": step
+        }
+    else:
+        model_snapshot = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step
+        }
+
+    torch.save(model_snapshot, os.path.join(config.save_dir,
+                                            "model_snapshot_{}.pth".format(tag)
+                                            if tag is not None else
+                                            "model_snapshot_{:07d}.pth".format(step)))
+    # update config file's test path
+    save_name = os.path.join(config.save_dir, 'config.yaml')
+    # config_save = edict(yaml.load(open(save_name, 'r'), Loader=yaml.FullLoader))
+    config_save = edict(yaml.load(open(save_name, 'r')))
+    config_save.test.test_model_dir = config.save_dir
+    config_save.test.test_model_name = "model_snapshot_{}.pth".format(
+          tag) if tag is not None else "model_snapshot_{:07d}.pth".format(step)
+    yaml.dump(edict2dict(config_save), open(save_name, 'w'), default_flow_style=False)
+
+
+def load_model(model, file_name, device, optimizer=None, scheduler=None):
+    model_snapshot = torch.load(file_name, map_location=device)
+    model.load_state_dict(model_snapshot["model"])
+    if optimizer is not None:
+        optimizer.load_state_dict(model_snapshot["optimizer"])
+
+    if scheduler is not None:
+        scheduler.load_state_dict(model_snapshot["scheduler"])

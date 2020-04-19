@@ -3,18 +3,21 @@ import wandb
 import torch
 import numpy as np
 import copy
+from tqdm import tqdm
+import time
 from torch import optim
 import torch.nn.functional as F
 from torch_geometric.utils import to_networkx
-from visualization.utils import draw_nx_graph, draw_pyg_graph, draw_graph_list
-from utils.utils import pad_adj_mat, get_graph, extract_batch, constraint_mask, get_subgraph
+from visualization.utils import *
+from utils.utils import *
 from utils.eval_utils import evaluate_generated
+from utils.dist_helper import compute_mmd, gaussian_emd, gaussian, emd, gaussian_tv
 import sys
 import networkx as nx
 import ipdb
 
-def test_generation(args, train_loader, test_loader, decoder, decoder_name,
-        flow_model=None, epoch=-1, oracle=None):
+def test_generation(args, config, train_loader, test_loader, decoder, decoder_name,
+        flow_model=None, epoch=-1):
 
     node_dist = args.node_dist
     edge_index = None
@@ -26,7 +29,7 @@ def test_generation(args, train_loader, test_loader, decoder, decoder_name,
     if not decoder_name:
         decoder_name = ''
 
-    save_gen_base = plots = './visualization/gen_plots/' + args.dataset + '/'
+    save_gen_base = plots = './visualization/gen_plots/' + config.dataset.name + '/'
     save_gen_plots = save_gen_base + args.model + str(args.z_dim) + '_' \
         + str(flow_name) + '_' + decoder_name + '/'
     gen_graph_list, gen_graph_copy_list = [], []
@@ -105,7 +108,7 @@ def test_generation(args, train_loader, test_loader, decoder, decoder_name,
 
         if len(g) > 0:
             # process the graphs
-            if args.better_vis:
+            if config.test.better_vis:
                 g = max(nx.connected_component_subgraphs(g), key=len)
             num_connected_components = nx.number_connected_components(g)
             avg_connected_components.append(num_connected_components)
@@ -118,13 +121,6 @@ def test_generation(args, train_loader, test_loader, decoder, decoder_name,
 
     # once graphs are generated
     total = len(gen_graph_list)  # min(3, len(vis_graphs))
-    if args.constraint:
-        constraint_str = args.constraint
-        _, constraint_loss, constr_sat = oracle.evaluate(args, num_nodes,
-                                                         adj_mats_padded)
-    else:
-        constraint_str = ''
-        constraint_loss, constr_sat = 0, 0
 
     draw_graph_list(gen_graph_list[:total], 3, int(total // 3),
                     fname='./visualization/sample/{}/{}_{}.png'.format(args.namestr,
@@ -173,7 +169,6 @@ def test_generation(args, train_loader, test_loader, decoder, decoder_name,
                                                                                         accuracy))
     print('Avg CC: {:.4f}, Avg. Tri: {:.4f}, Avg. Trans: {:.4f}'.format(mean_connected_comps, mean_triangles,
                                                                         mean_transitivity))
-    print('Test Constr Loss: {:.4f}, Test Constr Sat: {:.4f}'.format(constraint_loss, constr_sat))
     return [mmd_degree, mmd_clustering, mmd_4orbits, mmd_spectral, accuracy]
 
 def cond_test_generation(args, train_loader, test_loader, model, decoder, decoder_name,
@@ -265,13 +260,6 @@ def cond_test_generation(args, train_loader, test_loader, model, decoder, decode
     # once graphs are generated
     model.train()
     total = len(gen_graph_list)  # min(3, len(vis_graphs))
-    if args.constraint:
-        constraint_str = args.constraint
-        _, constraint_loss, constr_sat = oracle.evaluate(args, num_nodes,
-                                                         adj_mats_padded)
-    else:
-        constraint_str = ''
-        constraint_loss, constr_sat = 0, 0
 
     draw_graph_list(gen_graph_list[:args.num_gen_samples], 3, int(total // 3),
                     fname='./visualization/sample/{}/Cond_{}_{}.png'.format(args.namestr,
@@ -323,5 +311,118 @@ def cond_test_generation(args, train_loader, test_loader, model, decoder, decode
                                                                                         accuracy))
     print('Cond. Avg CC: {:.4f}, Avg. Tri: {:.4f}, Avg. Trans: {:.4f}'.format(mean_connected_comps, mean_triangles,
                                                                         mean_transitivity))
-    print('Cond. Test Constr Loss: {:.4f}, Cond. Test Constr Sat: {:.4f}'.format(constraint_loss, constr_sat))
     return [mmd_degree, mmd_clustering, mmd_4orbits, mmd_spectral, accuracy]
+
+def test(args, config, model, dataset):
+    config.save_dir = config.test.test_model_dir
+    ### Compute Erdos-Renyi baseline
+    if config.test.is_test_ER:
+      p_ER = sum([aa.number_of_edges() for aa in dataset.graphs_train]) / sum([aa.number_of_nodes() ** 2 for aa in dataset.graphs_train])
+      graphs_gen = [nx.fast_gnp_random_graph(config.model.max_num_nodes, p_ER,
+                                             seed=ii) for ii in
+                    range(config.test.num_test_gen)]
+    else:
+      ### load model
+      model_file = os.path.join(config.save_dir, config.test.test_model_name)
+      load_model(model, model_file, args.dev)
+
+      model.eval()
+
+      ### Generate Graphs
+      A_pred = []
+      num_nodes_pred = []
+      num_test_batch = int(np.ceil(config.test.num_test_gen / config.test.batch_size))
+
+      gen_run_time = []
+      for ii in tqdm(range(num_test_batch)):
+        with torch.no_grad():
+          start_time = time.time()
+          input_dict = {}
+          input_dict['is_sampling']=True
+          input_dict['batch_size']=config.test.batch_size
+          input_dict['num_nodes_pmf']=dataset.train_dataset.num_nodes_pmf_train
+          A_tmp = model(input_dict)
+          gen_run_time += [time.time() - start_time]
+          A_pred += [aa.data.cpu().numpy() for aa in A_tmp]
+          num_nodes_pred += [aa.shape[0] for aa in A_tmp]
+
+      print('Average test time per mini-batch = {}'.format(
+          np.mean(gen_run_time)))
+
+      graphs_gen = [get_graph(aa) for aa in A_pred]
+
+    ### Visualize Generated Graphs
+    if config.test.is_vis:
+      num_col = config.test.vis_num_row
+      num_row = int(np.ceil(config.test.num_vis / num_col))
+      test_epoch = config.test.test_model_name
+      test_epoch = test_epoch[test_epoch.rfind('_') + 1:test_epoch.find('.pth')]
+      plot_dir = config.save_dir + '/plots'
+      if not os.path.exists(plot_dir):
+          os.mkdir(plot_dir)
+      save_name = os.path.join(plot_dir,
+                               '{}_gen_graphs_epoch_{}_block_{}_stride_{}.png'.format(config.test.test_model_name[:-4],
+                                                                                      test_epoch,
+                                                                                      config.model.block_size,
+                                                                                      config.model.sample_stride))
+
+      # remove isolated nodes for better visulization
+      graphs_pred_vis = [copy.deepcopy(gg) for gg in graphs_gen[:config.test.num_vis]]
+
+      if config.test.better_vis:
+        for gg in graphs_pred_vis:
+          gg.remove_nodes_from(list(nx.isolates(gg)))
+
+      # display the largest connected component for better visualization
+      vis_graphs = []
+      for gg in graphs_pred_vis:
+        CGs = [gg.subgraph(c) for c in nx.connected_components(gg)]
+        CGs = sorted(CGs, key=lambda x: x.number_of_nodes(), reverse=True)
+        vis_graphs += [CGs[0]]
+
+      if config.test.is_single_plot:
+        draw_graph_list(vis_graphs, num_row, num_col, fname=save_name, layout='spring')
+      else:
+        draw_graph_list_separate(vis_graphs, fname=save_name[:-4], is_single=True, layout='spring')
+
+      save_name = os.path.join(plot_dir, 'train_graphs.png')
+
+      if config.test.is_single_plot:
+        draw_graph_list(
+            dataset.graphs_train[:config.test.num_vis],
+            num_row,
+            num_col,
+            fname=save_name,
+            layout='spring')
+      else:
+        draw_graph_list_separate(
+            dataset.graphs_train[:config.test.num_vis],
+            fname=save_name[:-4],
+            is_single=True,
+            layout='spring')
+
+    ### Evaluation
+    if config.dataset.name in ['lobster']:
+      acc = eval_acc_lobster_graph(graphs_gen)
+      print('Validity accuracy of generated graphs = {}'.format(acc))
+
+    num_nodes_gen = [len(aa) for aa in graphs_gen]
+
+    # Compared with Validation Set
+    num_nodes_dev = [len(gg.nodes) for gg in dataset.graphs_dev]  # shape B X 1
+    mmd_degree_dev, mmd_clustering_dev, mmd_4orbits_dev, mmd_spectral_dev, dev_acc = evaluate_generated(dataset.graphs_dev, graphs_gen, degree_only=False)
+    mmd_num_nodes_dev = compute_mmd([np.bincount(num_nodes_dev)], [np.bincount(num_nodes_gen)], kernel=gaussian_emd)
+
+    # Compared with Test Set
+    num_nodes_test = [len(gg.nodes) for gg in dataset.graphs_test]  # shape B X 1
+    mmd_degree_test, mmd_clustering_test, mmd_4orbits_test, mmd_spectral_test, test_acc= evaluate_generated(dataset.graphs_test, graphs_gen, degree_only=False)
+    mmd_num_nodes_test = compute_mmd([np.bincount(num_nodes_test)], [np.bincount(num_nodes_gen)], kernel=gaussian_emd)
+
+    print("Validation MMD scores of #nodes/degree/clustering/4orbits/spectral are = {}/{}/{}/{}/{}".format(mmd_num_nodes_dev, mmd_degree_dev, mmd_clustering_dev, mmd_4orbits_dev, mmd_spectral_dev))
+    print("Test MMD scores of #nodes/degree/clustering/4orbits/spectral are = {}/{}/{}/{}/{}".format(mmd_num_nodes_test, mmd_degree_test, mmd_clustering_test, mmd_4orbits_test, mmd_spectral_test))
+
+    if config.dataset.name in ['lobster']:
+      return mmd_degree_dev, mmd_clustering_dev, mmd_4orbits_dev, mmd_spectral_dev, mmd_degree_test, mmd_clustering_test, mmd_4orbits_test, mmd_spectral_test, acc
+    else:
+      return mmd_degree_dev, mmd_clustering_dev, mmd_4orbits_dev, mmd_spectral_dev, mmd_degree_test, mmd_clustering_test, mmd_4orbits_test, mmd_spectral_test
+

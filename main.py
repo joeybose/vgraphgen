@@ -8,12 +8,12 @@ import ipdb
 from data import create_dataset
 from models import create_model
 from train_helper import train_graph_generation
+from test_helper import test
 from utils import utils
 from utils.utils import seed_everything, str2bool
 from utils.arg_helper import parse_arguments, get_config
 
 def main(args, config):
-    ipdb.set_trace()
     dataset = create_dataset(args, config)
     train_loader, val_loader, test_loader = dataset.create_loaders()
     args.flow_args = [args.n_blocks, args.flow_hidden_size, args.n_hidden,
@@ -22,9 +22,11 @@ def main(args, config):
     print(vars(args))
     print(model)
     print('number of parameters : {}'.format(sum([np.prod(x.shape) for x in model.parameters()])))
-    trained_model = train_graph_generation(args, train_loader, val_loader,
-                                           test_loader, model)
-
+    if not args.test:
+        trained_model = train_graph_generation(args, config, train_loader,
+                                               val_loader, test_loader, model)
+    else:
+        test_model = test(args, config, model, dataset)
 
 if __name__ == '__main__':
     """

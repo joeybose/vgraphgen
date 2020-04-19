@@ -1,6 +1,6 @@
 from test_helper import test_generation
 from visualization.utils import *
-from utils.utils import pad_adj_mat, get_graph, extract_batch, constraint_mask, get_subgraph
+from utils.utils import *
 from utils.early_stopping import EarlyStopping
 from utils.eval_utils import evaluate_generated
 from distributions.normal import EuclideanNormal
@@ -24,9 +24,9 @@ sys.path.append("..")  # Adds higher directory to python modules path.
 kwargs_flows = {'MAFRealNVP': MAFRealNVP, 'RealNVP': RealNVP, 'MAF': MAF,
                 'MAFMOG':MAFMOG}
 
-def aggressive_burnin(args, epoch, kl_weight, anneal_rate, aggressive_flag,
-                      data_batch, model, enc_opt, dec_opt, train_loader,
-                      constraints, oracle):
+def aggressive_burnin(args, config, epoch, kl_weight, anneal_rate,
+                      aggressive_flag, data_batch, model, enc_opt, dec_opt,
+                      train_loader):
     burn_num_examples = 0
     burn_pre_loss = 1e4
     burn_cur_loss = 0
@@ -51,6 +51,7 @@ def aggressive_burnin(args, epoch, kl_weight, anneal_rate, aggressive_flag,
 
         enc_opt.zero_grad()
         dec_opt.zero_grad()
+        enc_lr_scheduler.step()
 
         burn_num_examples += batch[0]['adj'].size(0)
         z, z_k = model.encode(node_feats, edge_index)
@@ -153,118 +154,112 @@ def do_val(args, kl_weight, model, val_loader, constraints, oracle, epoch):
     model.train()
     return val_loss_avg[-1]
 
-def train_graph_generation(args, train_loader, val_loader, test_loader, model,
-                           constraints, oracle):
+def train_graph_generation(args, config, train_loader, val_loader, test_loader,
+                           model):
     # Initialize training diagnostics
     decay_cnt = cur_mi = pre_mi = best_mi = mi_not_improved = 0
     # KL weight increases linearly from KL_start to 1.0 overwarmup epochs
-    anneal_rate = (1.0 - args.kl_start) / (args.warmup * len(train_loader.dataset))
-    kl_weight = args.kl_start
-    aggressive_flag = True if args.aggressive else False
+    anneal_rate = (1.0 - config.kl.kl_start) / (config.kl.warmup * len(train_loader.dataset))
+    kl_weight = config.kl.kl_start
+    aggressive_flag = True if config.kl.aggressive else False
     # initialize the early_stopping object
-    early_stopping = EarlyStopping(patience=args.patience, verbose=True)
-
+    early_stopping = EarlyStopping(patience=config.kl.patience, verbose=True)
     if args.model != 'gran':
-        enc_opt = optim.Adam(model.encoder.parameters(), lr=args.lr)
-        dec_opt = optim.Adam(model.decoder.parameters(), lr=args.lr)
+        enc_opt = optim.Adam(model.encoder.parameters(), lr=config.train.lr)
+        dec_opt = optim.Adam(model.decoder.parameters(), lr=config.train.lr)
+        enc_lr_scheduler = optim.lr_scheduler.MultiStepLR(enc_opt,
+                                                          milestones=config.train.lr_decay_epoch,
+                                                          gamma=config.train.lr_decay)
     else:
         enc_opt = None
-        dec_opt = optim.Adam(model.parameters(), lr=args.lr)
+        dec_opt = optim.Adam(model.parameters(), lr=config.train.lr)
+
+    dec_lr_scheduler = optim.lr_scheduler.MultiStepLR(dec_opt,
+                                                      milestones=config.train.lr_decay_epoch,
+                                                      gamma=config.train.lr_decay)
+
     model.train()
+    iter_count = 0
 
     ### Start Training ###
-    print("Doing KL Anneal with KL start at %f for %d epochs" % (args.kl_start,
-                                                                 args.warmup))
-    for epoch in range(0, args.epochs):
-        constr_sat_avg, train_loss_avg, recon_loss_avg, kl_avg = [], [], [], []
-        neg_constr_loss_avg, pos_constr_loss_avg = [], []
-        pos_constr_loss_avg.append(0)
-        neg_constr_loss_avg.append(0)
-        constr_sat_avg.append(0)
+    print("Doing KL Anneal with KL start at %f for %d epochs" % (config.kl.kl_start,
+                                                                 config.kl.warmup))
+    for epoch in range(0, config.train.max_epoch):
+        train_loss_avg, recon_loss_avg, kl_avg = [], [], []
         train_loss_avg.append(0)
         recon_loss_avg.append(0)
         kl_avg.append(0)
+        if enc_opt is not None:
+            enc_lr_scheduler.step()
+        dec_lr_scheduler.step()
         for i, data_batch in enumerate(train_loader):
             # Do Burnin
-            sub_iter = aggressive_burnin(args, epoch, kl_weight, anneal_rate,
-                              aggressive_flag, data_batch, model, enc_opt,
-                              dec_opt, train_loader, constraints, oracle)
-            if args.aggressive and aggressive_flag:
+            avg_train_loss = .0
+            sub_iter = aggressive_burnin(args, config, epoch, kl_weight,
+                                         anneal_rate, aggressive_flag,
+                                         data_batch, model, enc_opt, dec_opt,
+                                         train_loader)
+            if config.kl.aggressive and aggressive_flag:
                 print("Done Aggressive Burn for Epoch %d in %d iters"
                       % (epoch, sub_iter))
+
+            if enc_opt is not None:
                 enc_opt.zero_grad()
-                dec_opt.zero_grad()
 
-            batch = extract_batch(args, data_batch)
-            # Correct shapes for VGAE processing
-            if len(batch[0]['adj'].shape) > 2:
-                # We give the full Adj to the encoder
-                adj = batch[0]['adj'] + batch[0]['adj'].transpose(2, 3)
-                node_feats = adj.view(-1, args.max_nodes)
-            else:
-                node_feats = batch[0]['adj']
-
-            if batch[0]['edges'].shape[0] != 2:
-                edge_index = batch[0]['encoder_edges'].long()
-            else:
-                edge_index = batch[0]['edges']
-
+            dec_opt.zero_grad()
+            batch = extract_batch(config.dataset.use_gran_data, args.dev, data_batch)
+            iter_count += 1
             if args.model == 'gran':
-                train_loss = recon_loss = model(*batch)
-
+                train_loss = recon_loss = model(*batch).mean()
                 # dummy tensor
                 kl_loss = recon_loss * 0
             else:
-                z, z_k = model.encode(node_feats, edge_index)
-                batch[0]['node_latents'] = z_k
-                batch[0]['return_adj'] = True
-
-                recon_loss, soft_adj_mat = model.decode(batch)
-                kl_weight = min(1.0, kl_weight + anneal_rate)
-                kl_loss = model.kl_loss(z, z_k, free_bits=args.free_bits)
-
-            # Check whether we want to enforce constraints at Train time
-            eval_const_cond = constraints is not None and not args.eval_const_test
-            if eval_const_cond:
-                input_batches = z_k.view(-1, args.max_nodes, args.z_dim)
-                domains, max_node_batches = oracle.constraint.get_domains(input_batches)
-                if args.decoder == 'gran':
-                    avg_neg_loss, z_star_batches = oracle.general_pgd(input_batches, domains,
-                                                                      max_node_batches, batch, num_restarts=1,
-                                                                      num_iters=args.num_iters, args=args)
-                    batch[0]['node_latents'] = z_star_batches
-                    _, adj_star = model.decode(batch)
+                # Correct shapes for VGAE processing
+                if len(batch[0]['adj'].shape) > 2:
+                    # We give the full Adj to the encoder
+                    adj = batch[0]['adj'] + batch[0]['adj'].transpose(2, 3)
+                    node_feats = adj.view(-1, args.max_nodes)
                 else:
-                    constraint_edge_index = constraint_mask(args, model)
-                    avg_neg_loss, z_star_batches = oracle.general_pgd(input_batches, domains,
-                                                                      max_node_batches, constraint_edge_index,
-                                                                      num_restarts=1, num_iters=args.num_iters,
-                                                                      args=args)
-                    _, adj_star = model.decoder(z_star_batches, constraint_edge_index, return_adj=True)
-                _, constraint_loss, constr_sat = oracle.evaluate(args, max_node_batches, adj_star)
-            else:
-                constraint_loss = recon_loss * 0
-                constr_sat = recon_loss * 0
-                avg_neg_loss = recon_loss * 0
+                    node_feats = batch[0]['adj']
+
+                if batch[0]['edges'].shape[0] != 2:
+                    edge_index = batch[0]['encoder_edges'].long()
+                else:
+                    edge_index = batch[0]['edges']
+
+                if args.model == 'gran':
+                    train_loss = recon_loss = model(*batch)
+
+                    # dummy tensor
+                    kl_loss = recon_loss * 0
+                else:
+                    z, z_k = model.encode(node_feats, edge_index)
+                    batch[0]['node_latents'] = z_k
+                    batch[0]['return_adj'] = True
+
+                    recon_loss, soft_adj_mat = model.decode(batch)
+                    kl_weight = min(1.0, kl_weight + anneal_rate)
+                    kl_loss = model.kl_loss(z, z_k, free_bits=args.free_bits)
 
             # Loss calculation
-            train_loss = recon_loss + kl_weight * kl_loss + args.constraint_weight * constraint_loss
+            train_loss = recon_loss + kl_weight * kl_loss
             train_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
             if not aggressive_flag and args.model != 'gran':
                 enc_opt.step()
 
             dec_opt.step()
+            avg_train_loss += train_loss
+            avg_train_loss /= float(config.dataset.num_fwd_pass)
+            print_train_loss = float(avg_train_loss.data.cpu().numpy())
+            if iter_count % config.train.display_iter == 0 or iter_count == 1:
+                print("NLL Loss @ epoch {:04d} iteration {:08d} = {}".format(epoch + 1, iter_count, print_train_loss))
 
             # Online Logging
             train_loss_avg[-1] += -1 * train_loss.item()
             recon_loss_avg[-1] += recon_loss.sum(dim=-1).item()
             kl_avg[-1] += kl_loss.item()
-            print("KL Loss %f Epoch: %d" %(kl_loss.item(), epoch))
-            pos_constr_loss_avg[-1] += constraint_loss.item()
-            neg_constr_loss_avg[-1] += avg_neg_loss.item()
-            constr_sat_avg[-1] += constr_sat
-
+            # print("KL Loss %f Epoch: %d" %(kl_loss.item(), epoch))
             train_loss_metric = 'Train Loss'
             elbo_metric = 'Elbo'
             recon_loss_metric = 'Reconstruction'
@@ -275,7 +270,6 @@ def train_graph_generation(args, train_loader, val_loader, test_loader, model,
                            elbo_metric: -1 * train_loss.item(),
                            recon_loss_metric: recon_loss.item(),
                            kl_metric: kl_loss.item(), "x": epoch,
-                           'Pos Cons. Loss': constraint_loss.item(),
                            'dataset': args.dataset,
                            })
 
@@ -286,9 +280,9 @@ def train_graph_generation(args, train_loader, val_loader, test_loader, model,
                         mi = calc_mi(args, model, test_loader)
                         # au, _ = calc_au(model, val_loader)
                     model.train()
-                print(
-                    'Train Loss : {:.4f}, MI: {:.4f}'.format(train_loss_avg[-1] / i, mi)) if aggressive_flag else print(
-                    'Train Loss : {:.4f}'.format(train_loss_avg[-1] / i))
+                # print(
+                    # 'Train Loss : {:.4f}, MI: {:.4f}'.format(train_loss_avg[-1] / i, mi)) if aggressive_flag else print(
+                    # 'Train Loss : {:.4f}'.format(train_loss_avg[-1] / i))
 
         # Reset Burnin Flags after each Epoch
         if aggressive_flag:
@@ -297,9 +291,9 @@ def train_graph_generation(args, train_loader, val_loader, test_loader, model,
             model.train()
             if cur_mi - best_mi < 0:
                 mi_not_improved += 1
-                # if mi_not_improved == 5:
-                    # aggressive_flag = False
-                    # print("STOP BURNING")
+                if mi_not_improved == 5:
+                    aggressive_flag = False
+                    print("STOP BURNING")
             else:
                 best_mi = cur_mi
 
@@ -308,32 +302,32 @@ def train_graph_generation(args, train_loader, val_loader, test_loader, model,
         train_loss_avg[-1] /= len(train_loader.dataset)
         recon_loss_avg[-1] /= len(train_loader.dataset)
         kl_avg[-1] /= (i + 1)
-        neg_constr_loss_avg[-1] /= (i + 1)
-        pos_constr_loss_avg[-1] /= (i + 1)
-        constr_sat_avg[-1] /= (i + 1)
-        print('Epoch: {:03d}, Recon:{:.4f}, Pseudo KL:{:.6f}, Train Loss: {:.4f}, '
-              'Neg Constr Loss: {:.4f}, Pos Constr Loss: {:.4f}, '
-              'Constr Sat: {:.4f}'.format(epoch, recon_loss_avg[-1],
-                                          kl_avg[-1], train_loss_avg[-1], neg_constr_loss_avg[-1],
-                                          pos_constr_loss_avg[-1], constr_sat_avg[-1]))
+        # print('Epoch: {:03d}, Recon:{:.4f}, Pseudo KL:{:.6f}, Train Loss: {:.4f}, '
+              # 'Neg Constr Loss: {:.4f}, Pos Constr Loss: {:.4f}, '
+              # 'Constr Sat: {:.4f}'.format(epoch, recon_loss_avg[-1],
+                                          # kl_avg[-1], train_loss_avg[-1], neg_constr_loss_avg[-1],
+                                          # pos_constr_loss_avg[-1], constr_sat_avg[-1]))
+        # snapshot model
+        if (epoch + 1) % config.train.snapshot_epoch == 0:
+            print("Saving Snapshot @ epoch {:04d}".format(epoch + 1))
+            snapshot(model, dec_opt, config, epoch + 1,
+                     scheduler=dec_lr_scheduler)
+        # val_loss = do_val(args, kl_weight, model, val_loader, constraints,
+                          # oracle, epoch)
+        # early_stopping(-1*val_loss, model)
 
-        val_loss = do_val(args, kl_weight, model, val_loader, constraints,
-                          oracle, epoch)
-        early_stopping(-1*val_loss, model)
-
-        if (epoch + 1) % args.sample_every == 0:
-            # TODO: memory leak?
-            if args.model == 'gran':
-                test_generation(args, train_loader, test_loader, model, 'gran',
-                                None, epoch=epoch, oracle=oracle)
-            else:
-                test_generation(args, train_loader, test_loader, model.decoder,
-                        model.decoder_name, model.encoder.flow_model,
-                        epoch=epoch, oracle=oracle)
-                cond_test_generation(args, train_loader, test_loader, model,
-                                     model.decoder, model.decoder_name,
-                                     model.encoder.flow_model, epoch=epoch,
-                                     oracle=oracle)
+        # if (epoch + 1) % config.dataset.sample_every == 0:
+            # # TODO: memory leak?
+            # if args.model == 'gran':
+                # test_generation(args, train_loader, test_loader, model, 'gran',
+                                # None, epoch=epoch)
+            # else:
+                # test_generation(args, train_loader, test_loader, model.decoder,
+                        # model.decoder_name, model.encoder.flow_model,
+                        # epoch=epoch)
+                # cond_test_generation(args, train_loader, test_loader, model,
+                                     # model.decoder, model.decoder_name,
+                                     # model.encoder.flow_model, epoch=epoch)
         if early_stopping.early_stop:
             print("Early stopping")
             break
